@@ -95,7 +95,7 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 	}
 	switch {
 	case sl.EnableAuth && method == USERPASSWORD:
-		// Ook,pass.
+		// ok,pass.
 	case !sl.EnableAuth && method == NOAUTHENTICATION:
 		// ok.pass.
 	default:
