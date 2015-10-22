@@ -34,7 +34,7 @@ const (
 
 type Socks5Listen struct {
 	EnableAuth bool
-	Auth       func(id, pwd string) bool
+	Auth       func(id, pwd []byte) bool
 	RawListen  net.Listener
 }
 
@@ -105,6 +105,52 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 	_, err = conn.Write([]byte{Ver, method})
 	if err != nil {
 		return nil, err
+	}
+	if method == USERPASSWORD {
+		// This begins with the client producing a
+		//   Username/Password request:
+		//           +----+------+----------+------+----------+
+		//           |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+		//           +----+------+----------+------+----------+
+		//           | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+		//           +----+------+----------+------+----------+
+
+		// check the user and password.
+		// read username.
+		head1 := head[:2]
+		if _, err = io.ReadAtLeast(conn, head, 2); err != nil {
+			return nil, err
+		}
+		ulen := int(head1[1])
+		if ulen < 1 || ulen > 255 {
+			return nil, fmt.Errorf("Error ulen:%v", ulen)
+		}
+		uname := make([]byte, ulen)
+		if _, err = io.ReadAtLeast(conn, uname, ulen); err != nil {
+			return nil, err
+		}
+		head2 := head[:1]
+		if _, err = io.ReadAtLeast(conn, head2, 1); err != nil {
+			return nil, err
+		}
+		plen := int(head2[0])
+		if plen < 1 || plen > 255 {
+			return nil, fmt.Errorf("Error plen:%v", ulen)
+		}
+		passwd := make([]byte, plen)
+		if _, err = io.ReadAtLeast(conn, passwd, plen); err != nil {
+			return nil, err
+		}
+		if !sl.Auth(uname, passwd) {
+			// not allower user.
+			conn.Write([]byte{0x01, 0x01})
+			return nil, fmt.Errorf("User(%s) or Password(%s) error", uname, passwd)
+		} else {
+			_, err = conn.Write([]byte{0x01, 0x00})
+			if err != nil {
+				return nil, e
+			}
+		}
 	}
 
 }
