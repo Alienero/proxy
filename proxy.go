@@ -48,12 +48,34 @@ const (
 	IPv4       = 0x01
 	DOMAINNAME = 0x03
 	IPv6       = 0x04
+
+	// o  REP    Reply field:
+	//            o  X'00' succeeded
+	//            o  X'01' general SOCKS server failure
+	//            o  X'02' connection not allowed by ruleset
+	//            o  X'03' Network unreachable
+	//            o  X'04' Host unreachable
+	//            o  X'05' Connection refused
+	//            o  X'06' TTL expired
+	//            o  X'07' Command not supported
+	//            o  X'08' Address type not supported
+	//            o  X'09' to X'FF' unassigned
+	SUCCEEDED = 0x00
 )
 
+// AddrSpec is used to return the target AddrSpec
+// which may be specified as IPv4, IPv6, or a FQDN
+type AddrSpec struct {
+	FQDN string
+	IP   net.IP
+	Port int
+}
+
 type Socks5Listen struct {
-	EnableAuth bool
-	Auth       func(id, pwd []byte) bool
-	RawListen  net.Listener
+	EnableAuth   bool
+	Auth         func(id, pwd []byte) bool
+	HandleConnet func(addr string) (*net.TCPConn, error)
+	RawListen    net.Listener
 }
 
 // Accept waits for and returns the next connection to the listener.
@@ -180,6 +202,71 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// replay.
+	// The server evaluates the request, and
+	//  returns a reply formed as follows:
+	//       +----+-----+-------+------+----------+----------+
+	//       |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+	//       +----+-----+-------+------+----------+----------+
+	//       | 1  |  1  | X'00' |  1   | Variable |    2     |
+	//       +----+-----+-------+------+----------+----------+
+	// handle connect.
+	local, err := sl.HandleConnet(hostPort)
+	if err != nil {
+		return nil, err
+	}
+	bind := AddrSpec{IP: local.IP, Port: local.Port}
+	err = sl.sendReply(conn, SUCCEEDED, &bind)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: create socks5 conn
+}
+
+// sendReply is used to send a reply message
+func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
+	// Format the address
+	var addrType uint8
+	var addrBody []byte
+	var addrPort uint16
+	switch {
+	case addr == nil:
+		addrType = ipv4Address
+		addrBody = []byte{0, 0, 0, 0}
+		addrPort = 0
+
+	case addr.FQDN != "":
+		addrType = DOMAINNAME
+		addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
+		addrPort = uint16(addr.Port)
+
+	case addr.IP.To4() != nil:
+		addrType = ipv4Address
+		addrBody = []byte(addr.IP.To4())
+		addrPort = uint16(addr.Port)
+
+	case addr.IP.To16() != nil:
+		addrType = ipv6Address
+		addrBody = []byte(addr.IP.To16())
+		addrPort = uint16(addr.Port)
+
+	default:
+		return fmt.Errorf("Failed to format address: %v", addr)
+	}
+
+	// Format the message
+	msg := make([]byte, 6+len(addrBody))
+	msg[0] = socks5Version
+	msg[1] = resp
+	msg[2] = 0 // Reserved
+	msg[3] = addrType
+	copy(msg[4:], addrBody)
+	msg[4+len(addrBody)] = byte(addrPort >> 8)
+	msg[4+len(addrBody)+1] = byte(addrPort & 0xff)
+
+	// Send the message
+	_, err := w.Write(msg)
+	return err
 }
 
 func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
