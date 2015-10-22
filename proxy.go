@@ -12,9 +12,11 @@
 package proxy
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 )
 
 const (
@@ -30,6 +32,22 @@ const (
 	NOAUTHENTICATION = 0x00
 	USERPASSWORD     = 0x02
 	NOTACCEPTMETHOD  = 0xff
+
+	// get request head.
+	// o  CMD
+	//    o  CONNECT X'01'
+	//    o  BIND X'02'
+	//    o  UDP ASSOCIATE X'03'
+	// o  ATYP   address type of following address
+	//    o  IP V4 address: X'01'
+	//    o  DOMAINNAME: X'03'
+	//    o  IP V6 address: X'04'
+	CONNECT    = 0x01
+	BIND       = 0x02
+	UDP        = 0x03
+	IPv4       = 0x01
+	DOMAINNAME = 0x03
+	IPv6       = 0x04
 )
 
 type Socks5Listen struct {
@@ -44,6 +62,12 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 	if err != nil {
 		return nil, err
 	}
+	var needClose = true
+	defer func() {
+		if needClose {
+			conn.Close()
+		}
+	}()
 	// handle shake.
 	//  The client connects to the server, and sends a version
 	//  identifier/method selection message:
@@ -152,7 +176,77 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 			}
 		}
 	}
+	hostPort, err := sl.getRequest(conn)
+	if err != nil {
+		return nil, err
+	}
+}
 
+func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
+	// The SOCKS request is formed as follows:
+	//       +----+-----+-------+------+----------+----------+
+	//       |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+	//       +----+-----+-------+------+----------+----------+
+	//       | 1  |  1  | X'00' |  1   | Variable |    2     |
+	//       +----+-----+-------+------+----------+----------+
+	const (
+		lenIPv4   = 3 + 1 + net.IPv4len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv4 + 2port
+		lenIPv6   = 3 + 1 + net.IPv6len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv6 + 2port
+		lenDmBase = 3 + 1 + 1 + 2           // 3 + 1addrType + 1addrLen + 2port, plus addrLen
+	)
+	// DST.PORT must 255 + 1
+	buf := make([]byte, 262)
+	n, err := io.ReadAtLeast(conn, buf, 5)
+	if err != nil {
+		return "", err
+	}
+	if buf[0] != Ver {
+		return "", fmt.Errorf("Not support version:%v", buf[0])
+	}
+	switch buf[1] {
+	case CONNECT:
+		var (
+			addrLen   = 0
+			perfixLen = 0
+		)
+		// ATYP
+		switch buf[3] {
+		case IPv4:
+			perfixLen = 4
+			addrLen = net.IPv4len
+		case DOMAINNAME:
+			perfixLen = 5
+			addrLen = int(buf[4])
+		case IPv6:
+			perfixLen = 4
+			addrLen = net.IPv6len
+		}
+		// prot's length is 2.
+		reqLen := perfixLen + addrLen + 2
+		if n < reqLen {
+			if _, err = io.ReadFull(conn, buf[n:reqLen]); err != mil {
+				return "", err
+			}
+		} else if n > reqLen {
+			return "", fmt.Errorf("Error request's length:%v", n)
+		}
+		// get dst's addr and port.
+		var host string
+		switch buf[3] {
+		case IPv4, IPv6:
+			host = net.IP(buf[perfixLen : perfixLen+addrLen]).String()
+		case DOMAINNAME:
+			host = string(buf[perfixLen : perfixLen+addrLen])
+		}
+		port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
+		host = net.JoinHostPort(host, strconv.Itoa(int(port)))
+		return host, nil
+	case BIND:
+		// TODO
+		return "", nil
+	default:
+		return "", fmt.Errorf("Not support command:%v", buf[1])
+	}
 }
 
 // Close closes the listener.
