@@ -44,6 +44,7 @@ const (
 	//    o  IP V6 address: X'04'
 	CONNECT    = 0x01
 	BIND       = 0x02
+	ASSOCIATE  = 0x03
 	UDP        = 0x03
 	IPv4       = 0x01
 	DOMAINNAME = 0x03
@@ -331,6 +332,8 @@ func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
 	case BIND:
 		// TODO
 		return "", nil
+	case ASSOCIATE:
+		// TODO
 	default:
 		return "", fmt.Errorf("Not support command:%v", buf[1])
 	}
