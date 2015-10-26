@@ -74,11 +74,11 @@ type AddrSpec struct {
 }
 
 type Socks5Listen struct {
-	EnableAuth   bool
-	Auth         func(id, pwd []byte) bool
-	HandleConnet func(addr string) (*net.TCPConn, error)
-	Transport    func(target net.Conn, client net.Conn) error
-	RawListen    net.Listener
+	EnableAuth    bool
+	Auth          func(id, pwd []byte) bool
+	HandleConnect func(addr string) (*net.TCPConn, error)
+	Transport     func(target net.Conn, client net.Conn) error
+	RawListen     net.Listener
 }
 
 func (sl *Socks5Listen) Listen() (err error) {
@@ -219,7 +219,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 	//       | 1  |  1  | X'00' |  1   | Variable |    2     |
 	//       +----+-----+-------+------+----------+----------+
 	// handle connect.
-	target, err := sl.HandleConnet(hostPort)
+	target, err := sl.HandleConnect(hostPort)
 	if err != nil {
 		return err
 	}

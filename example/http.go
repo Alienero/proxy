@@ -17,7 +17,7 @@ func main() {
 		panic(err)
 	}
 	socks5 := proxy.Socks5Listen{
-		HandleConnet: func(addr string) (*net.TCPConn, error) {
+		HandleConnect: func(addr string) (*net.TCPConn, error) {
 			logger.Println("connet addr:=", addr)
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
