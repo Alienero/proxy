@@ -18,6 +18,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"time"
 )
 
 const (
@@ -74,19 +75,35 @@ type AddrSpec struct {
 }
 
 type Socks5Listen struct {
+	RawListen     net.Listener
 	EnableAuth    bool
 	Auth          func(id, pwd []byte) bool
 	HandleConnect func(addr string) (*net.TCPConn, error)
-	Transport     func(target net.Conn, client net.Conn) error
-	RawListen     net.Listener
+	// You should not close connettions in transport.
+	Transport func(target net.Conn, client net.Conn) error
 }
 
 func (sl *Socks5Listen) Listen() (err error) {
+	var tempDelay time.Duration
 	for {
-		conn, err := sl.RawListen.Accept()
-		if err != nil {
+		conn, e := sl.RawListen.Accept()
+		if e != nil {
+			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				log.Printf("proxy server: Accept error: %v; retrying in %v", e, tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
 			return err
 		}
+		tempDelay = 0
 		go func() {
 			if err := sl.serve(conn); err != nil {
 				log.Println("serve get an error:", err.Error())
@@ -223,6 +240,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+	defer target.Close()
 	local := target.LocalAddr().(*net.TCPAddr)
 	bind := AddrSpec{IP: local.IP, Port: local.Port}
 	err = sl.sendReply(conn, SUCCEEDED, &bind)
