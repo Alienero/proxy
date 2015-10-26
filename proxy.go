@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 )
@@ -86,7 +87,11 @@ func (sl *Socks5Listen) Listen() (err error) {
 		if err != nil {
 			return err
 		}
-		go sl.serve(conn)
+		go func() {
+			if err := sl.serve(conn); err != nil {
+				log.Println("serve get an error:", err.Error())
+			}
+		}()
 	}
 }
 
@@ -127,23 +132,19 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 			return err
 		}
 	}
-	method := NOTACCEPTMETHOD
+	method := -1
 	if msgLen > 2 {
-		var tm int
-		for _, i := range head[2:] {
+		for _, i := range head[2:msgLen] {
 			switch int(i) {
 			case NOAUTHENTICATION:
-				if NOAUTHENTICATION > tm {
-					tm = NOAUTHENTICATION
+				if NOAUTHENTICATION > method {
+					method = NOAUTHENTICATION
 				}
 			case USERPASSWORD:
-				if USERPASSWORD > tm {
-					tm = USERPASSWORD
+				if USERPASSWORD > method {
+					method = USERPASSWORD
 				}
 			}
-		}
-		if tm != 0 {
-			method = tm
 		}
 	}
 	switch {
@@ -153,7 +154,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 		// ok.pass.
 	default:
 		_, err = conn.Write([]byte{Ver, NOTACCEPTMETHOD})
-		return fmt.Errorf("Not accept method:%v", head[1])
+		return fmt.Errorf("Not accept method:%v", method)
 	}
 	_, err = conn.Write([]byte{Ver, byte(method)})
 	if err != nil {
