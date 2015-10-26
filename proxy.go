@@ -76,15 +76,21 @@ type Socks5Listen struct {
 	EnableAuth   bool
 	Auth         func(id, pwd []byte) bool
 	HandleConnet func(addr string) (*net.TCPConn, error)
+	Transport    func(target net.Conn, client net.Conn) error
 	RawListen    net.Listener
 }
 
-// Accept waits for and returns the next connection to the listener.
-func (sl *Socks5Listen) Accept() (c Conn, err error) {
-	conn, err := sl.RawListen.Accept()
-	if err != nil {
-		return nil, err
+func (sl *Socks5Listen) Listen() (err error) {
+	for {
+		conn, err := sl.RawListen.Accept()
+		if err != nil {
+			return err
+		}
+		go sl.serve(conn)
 	}
+}
+
+func (sl *Socks5Listen) serve(conn net.Conn) error {
 	var needClose = true
 	defer func() {
 		if needClose {
@@ -108,11 +114,11 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 	// make suer must read nmethods.
 	n, err := io.ReadAtLeast(conn, head, 2)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// parser head.
 	if head[0] != Ver {
-		return nil, fmt.Errorf("Not support version:%v", head[0])
+		return fmt.Errorf("Not support version:%v", head[0])
 	}
 	nmethod := int(head[1])
 	msgLen := nmethod + 2
@@ -147,11 +153,11 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 		// ok.pass.
 	default:
 		_, err = conn.Write([]byte{Ver, NOTACCEPTMETHOD})
-		return nil, fmt.Errorf("Not accept method:%v", head[1])
+		return fmt.Errorf("Not accept method:%v", head[1])
 	}
-	_, err = conn.Write([]byte{Ver, method})
+	_, err = conn.Write([]byte{Ver, byte(method)})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if method == USERPASSWORD {
 		// This begins with the client producing a
@@ -166,42 +172,42 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 		// read username.
 		head1 := head[:2]
 		if _, err = io.ReadAtLeast(conn, head, 2); err != nil {
-			return nil, err
+			return err
 		}
 		ulen := int(head1[1])
 		if ulen < 1 || ulen > 255 {
-			return nil, fmt.Errorf("Error ulen:%v", ulen)
+			return fmt.Errorf("Error ulen:%v", ulen)
 		}
 		uname := make([]byte, ulen)
 		if _, err = io.ReadAtLeast(conn, uname, ulen); err != nil {
-			return nil, err
+			return err
 		}
 		head2 := head[:1]
 		if _, err = io.ReadAtLeast(conn, head2, 1); err != nil {
-			return nil, err
+			return err
 		}
 		plen := int(head2[0])
 		if plen < 1 || plen > 255 {
-			return nil, fmt.Errorf("Error plen:%v", ulen)
+			return fmt.Errorf("Error plen:%v", ulen)
 		}
 		passwd := make([]byte, plen)
 		if _, err = io.ReadAtLeast(conn, passwd, plen); err != nil {
-			return nil, err
+			return err
 		}
 		if !sl.Auth(uname, passwd) {
 			// not allower user.
 			conn.Write([]byte{0x01, 0x01})
-			return nil, fmt.Errorf("User(%s) or Password(%s) error", uname, passwd)
+			return fmt.Errorf("User(%s) or Password(%s) error", uname, passwd)
 		} else {
 			_, err = conn.Write([]byte{0x01, 0x00})
 			if err != nil {
-				return nil, e
+				return err
 			}
 		}
 	}
 	hostPort, err := sl.getRequest(conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// replay.
 	// The server evaluates the request, and
@@ -212,16 +218,17 @@ func (sl *Socks5Listen) Accept() (c Conn, err error) {
 	//       | 1  |  1  | X'00' |  1   | Variable |    2     |
 	//       +----+-----+-------+------+----------+----------+
 	// handle connect.
-	local, err := sl.HandleConnet(hostPort)
+	target, err := sl.HandleConnet(hostPort)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	local := target.LocalAddr().(*net.TCPAddr)
 	bind := AddrSpec{IP: local.IP, Port: local.Port}
 	err = sl.sendReply(conn, SUCCEEDED, &bind)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	// TODO: create socks5 conn
+	return sl.Transport(target, conn)
 }
 
 // sendReply is used to send a reply message
@@ -232,7 +239,7 @@ func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error
 	var addrPort uint16
 	switch {
 	case addr == nil:
-		addrType = ipv4Address
+		addrType = IPv4
 		addrBody = []byte{0, 0, 0, 0}
 		addrPort = 0
 
@@ -242,12 +249,12 @@ func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error
 		addrPort = uint16(addr.Port)
 
 	case addr.IP.To4() != nil:
-		addrType = ipv4Address
+		addrType = IPv4
 		addrBody = []byte(addr.IP.To4())
 		addrPort = uint16(addr.Port)
 
 	case addr.IP.To16() != nil:
-		addrType = ipv6Address
+		addrType = IPv6
 		addrBody = []byte(addr.IP.To16())
 		addrPort = uint16(addr.Port)
 
@@ -257,7 +264,7 @@ func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error
 
 	// Format the message
 	msg := make([]byte, 6+len(addrBody))
-	msg[0] = socks5Version
+	msg[0] = Ver
 	msg[1] = resp
 	msg[2] = 0 // Reserved
 	msg[3] = addrType
@@ -277,11 +284,6 @@ func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
 	//       +----+-----+-------+------+----------+----------+
 	//       | 1  |  1  | X'00' |  1   | Variable |    2     |
 	//       +----+-----+-------+------+----------+----------+
-	const (
-		lenIPv4   = 3 + 1 + net.IPv4len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv4 + 2port
-		lenIPv6   = 3 + 1 + net.IPv6len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv6 + 2port
-		lenDmBase = 3 + 1 + 1 + 2           // 3 + 1addrType + 1addrLen + 2port, plus addrLen
-	)
 	// DST.PORT must 255 + 1
 	buf := make([]byte, 262)
 	n, err := io.ReadAtLeast(conn, buf, 5)
@@ -312,7 +314,7 @@ func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
 		// prot's length is 2.
 		reqLen := perfixLen + addrLen + 2
 		if n < reqLen {
-			if _, err = io.ReadFull(conn, buf[n:reqLen]); err != mil {
+			if _, err = io.ReadFull(conn, buf[n:reqLen]); err != nil {
 				return "", err
 			}
 		} else if n > reqLen {
@@ -334,6 +336,7 @@ func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
 		return "", nil
 	case ASSOCIATE:
 		// TODO
+		return "", nil
 	default:
 		return "", fmt.Errorf("Not support command:%v", buf[1])
 	}
@@ -346,6 +349,6 @@ func (sl *Socks5Listen) Close() error {
 }
 
 // Addr returns the listener's network address.
-func (sl *Socks5Listen) Addr() Addr {
+func (sl *Socks5Listen) Addr() net.Addr {
 	return sl.RawListen.Addr()
 }
