@@ -87,6 +87,8 @@ type Socks5Listen struct {
 	TransportUdp func(localConn *net.UDPConn, clientAddr string, stop chan struct{}) error
 }
 
+func SetUdpRequest() {}
+
 func GetUdpRequest(buffer []byte) (targetHost string, data []byte, err error) {
 	// 	+----+------+------+----------+----------+----------+
 	//      |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
