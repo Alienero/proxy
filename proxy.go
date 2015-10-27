@@ -87,26 +87,135 @@ type Socks5Listen struct {
 	TransportUdp func(localConn *net.UDPConn, clientAddr string, stop chan struct{}) error
 }
 
-func SetUdpRequest() {}
+func DefaultHandleAssociate() (*net.UDPConn, error) {
+	laddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp", laddr)
+}
 
-func GetUdpRequest(buffer []byte) (targetHost string, data []byte, err error) {
-	// 	+----+------+------+----------+----------+----------+
-	//      |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-	//      +----+------+------+----------+----------+----------+
-	//      | 2  |  1   |  1   | Variable |    2     | Variable |
-	//      +----+------+------+----------+----------+----------+
+func DefaultHandleConnect(addr string) (*net.TCPConn, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.TCPConn), nil
+}
 
-	//     The fields in the UDP request header are:
+func DefaultTransport(target net.Conn, client net.Conn) error {
+	go io.Copy(client, target)
+	_, err := io.Copy(target, client)
+	return err
+}
 
-	//          o  RSV  Reserved X'0000'
-	//          o  FRAG    Current fragment number
-	//          o  ATYP    address type of following addresses:
-	//             o  IP V4 address: X'01'
-	//             o  DOMAINNAME: X'03'
-	//             o  IP V6 address: X'04'
-	//          o  DST.ADDR       desired destination address
-	//          o  DST.PORT       desired destination port
-	//          o  DATA     user data
+func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan struct{}) error {
+	buff := make([]byte, MaxUdpLen)
+	errCh := make(chan error, 1)
+	// read data.
+	go func() {
+		clientUdpAddr, err := net.ResolveUDPAddr("udp", clientAddr)
+		if err != nil {
+			errCh <- err
+			close(errCh)
+			return
+		}
+		for {
+			n, addr, err := localConn.ReadFromUDP(buff)
+			if err != nil {
+				errCh <- err
+				close(errCh)
+				return
+			}
+			if clientAddr == net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port))) {
+				// data from client.
+				hostPort, data, err := GetUdpRequest(buff[:n])
+				if err != nil {
+					errCh <- err
+					close(errCh)
+					return
+				}
+				targetAddr, err := net.ResolveUDPAddr("udp", hostPort)
+				if err != nil {
+					errCh <- err
+					close(errCh)
+					return
+				}
+				n, err = localConn.WriteToUDP(data, targetAddr)
+				if err != nil {
+					errCh <- err
+					close(errCh)
+					return
+				}
+
+			} else {
+				// data from remote server.
+				data, err := SetUdpRequest(clientUdpAddr, 0, buff[:n])
+				if err != nil {
+					errCh <- err
+					close(errCh)
+					return
+				}
+				_, err = localConn.WriteToUDP(data, clientUdpAddr)
+				if err != nil {
+					errCh <- err
+					close(errCh)
+					return
+				}
+			}
+		}
+
+	}()
+
+	for {
+		select {
+		case <-stop:
+			return nil
+		case err := <-errCh:
+			return err
+		}
+	}
+}
+
+// Set and get udp request.
+
+// 	+----+------+------+----------+----------+----------+
+//      |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+//      +----+------+------+----------+----------+----------+
+//      | 2  |  1   |  1   | Variable |    2     | Variable |
+//      +----+------+------+----------+----------+----------+
+
+//     The fields in the UDP request header are:
+
+//          o  RSV  Reserved X'0000'
+//          o  FRAG    Current fragment number
+//          o  ATYP    address type of following addresses:
+//             o  IP V4 address: X'01'
+//             o  DOMAINNAME: X'03'
+//             o  IP V6 address: X'04'
+//          o  DST.ADDR       desired destination address
+//          o  DST.PORT       desired destination port
+//          o  DATA     user data
+
+func SetUdpRequest(dstAddr *net.UDPAddr, frag int, data []byte) ([]byte, error) {
+	addrType, addrBody, addrPort, err := formatSocks5Addr(
+		&AddrSpec{
+			IP:   dstAddr.IP,
+			Port: dstAddr.Port,
+		})
+	if err != nil {
+		return nil, err
+	}
+	buff := make([]byte, 0, 4+len(addrBody)+2+len(data))
+	buff = append(buff, []byte{0, 0, 0}...)
+	buff = append(buff, addrType)
+	buff = append(buff, addrBody...)
+	buff = append(buff, addrPort...)
+	buff = append(buff, data...)
+	return buff, nil
+}
+
+func GetUdpRequest(buffer []byte) (targetHostPort string, data []byte, err error) {
 	if len(buffer) > 10 {
 		return "", nil, fmt.Errorf("Udp head buffer length(%v) is too small", len(buffer))
 	}
@@ -137,17 +246,9 @@ func GetUdpRequest(buffer []byte) (targetHost string, data []byte, err error) {
 		host = string(buffer[perfixLen : perfixLen+addrLen])
 	}
 	port = int(binary.BigEndian.Uint16(buffer[perfixLen+addrLen : perfixLen+addrLen+2]))
-	targetHost = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	targetHostPort = net.JoinHostPort(host, strconv.Itoa(int(port)))
 	data = buffer[perfixLen+addrLen:]
 	return
-}
-
-func DefaultHandleAssociate() (*net.UDPConn, error) {
-	laddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
-	if err != nil {
-		return nil, err
-	}
-	return net.ListenUDP("udp", laddr)
 }
 
 func (sl *Socks5Listen) Listen() (err error) {
@@ -327,8 +428,19 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 		bind := AddrSpec{IP: local.IP, Port: local.Port}
 		err = sl.sendReply(conn, SUCCEEDED, &bind)
 		// handle udp.
-
-		return nil
+		stop := make(chan struct{}, 1)
+		go func() {
+			for {
+				b := make([]byte, 1)
+				_, err := conn.Read(b)
+				if err != nil {
+					stop <- struct{}{}
+					close(stop)
+					return
+				}
+			}
+		}()
+		return sl.TransportUdp(target, hostPort, stop)
 	default:
 		return fmt.Errorf("Not support reply cmd:%v", cmd)
 	}
@@ -336,35 +448,10 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 
 // sendReply is used to send a reply message
 func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
-	// Format the address
-	var addrType uint8
-	var addrBody []byte
-	var addrPort uint16
-	switch {
-	case addr == nil:
-		addrType = IPv4
-		addrBody = []byte{0, 0, 0, 0}
-		addrPort = 0
-
-	case addr.FQDN != "":
-		addrType = DOMAINNAME
-		addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
-		addrPort = uint16(addr.Port)
-
-	case addr.IP.To4() != nil:
-		addrType = IPv4
-		addrBody = []byte(addr.IP.To4())
-		addrPort = uint16(addr.Port)
-
-	case addr.IP.To16() != nil:
-		addrType = IPv6
-		addrBody = []byte(addr.IP.To16())
-		addrPort = uint16(addr.Port)
-
-	default:
-		return fmt.Errorf("Failed to format address: %v", addr)
+	addrType, addrBody, addrPort, err := formatSocks5Addr(addr)
+	if err != nil {
+		return err
 	}
-
 	// Format the message
 	msg := make([]byte, 6+len(addrBody))
 	msg[0] = Ver
@@ -372,12 +459,43 @@ func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error
 	msg[2] = 0 // Reserved
 	msg[3] = addrType
 	copy(msg[4:], addrBody)
-	msg[4+len(addrBody)] = byte(addrPort >> 8)
-	msg[4+len(addrBody)+1] = byte(addrPort & 0xff)
+	msg[4+len(addrBody)] = addrPort[0]
+	msg[4+len(addrBody)+1] = addrPort[1]
 
 	// Send the message
-	_, err := w.Write(msg)
+	_, err = w.Write(msg)
 	return err
+}
+
+// Format the address
+func formatSocks5Addr(addr *AddrSpec) (addrType byte, addrBody []byte, addrPort []byte, err error) {
+	addrPort = make([]byte, 2)
+	switch {
+	case addr == nil:
+		addrType = IPv4
+		addrBody = []byte{0, 0, 0, 0}
+		addrPort[0], addrPort[1] = 0, 0
+
+	case addr.FQDN != "":
+		addrType = DOMAINNAME
+		addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
+		addrPort[0], addrPort[1] = byte(addr.Port>>8), byte(addr.Port&0xff)
+
+	case addr.IP.To4() != nil:
+		addrType = IPv4
+		addrBody = []byte(addr.IP.To4())
+		addrPort[0], addrPort[1] = byte(addr.Port>>8), byte(addr.Port&0xff)
+
+	case addr.IP.To16() != nil:
+		addrType = IPv6
+		addrBody = []byte(addr.IP.To16())
+		addrPort[0], addrPort[1] = byte(addr.Port>>8), byte(addr.Port&0xff)
+
+	default:
+		err = fmt.Errorf("Failed to format address: %v", addr)
+		return
+	}
+	return
 }
 
 func (sl *Socks5Listen) getRequest(conn net.Conn) (string, int, error) {
