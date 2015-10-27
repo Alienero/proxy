@@ -22,6 +22,8 @@ import (
 )
 
 const (
+	MaxUdpLen = 80192
+
 	Ver = 0x05
 
 	// Socks5 server method.
@@ -75,12 +77,75 @@ type AddrSpec struct {
 }
 
 type Socks5Listen struct {
-	RawListen     net.Listener
-	EnableAuth    bool
-	Auth          func(id, pwd []byte) bool
-	HandleConnect func(addr string) (*net.TCPConn, error)
+	RawListen       net.Listener
+	EnableAuth      bool
+	Auth            func(id, pwd []byte) bool
+	HandleConnect   func(addr string) (*net.TCPConn, error)
+	HandleAssociate func() (*net.UDPConn, error)
 	// You should not close connettions in transport.
-	Transport func(target net.Conn, client net.Conn) error
+	Transport    func(target net.Conn, client net.Conn) error
+	TransportUdp func(localConn *net.UDPConn, clientAddr string, stop chan struct{}) error
+}
+
+func GetUdpRequest(buffer []byte) (targetHost string, data []byte, err error) {
+	// 	+----+------+------+----------+----------+----------+
+	//      |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+	//      +----+------+------+----------+----------+----------+
+	//      | 2  |  1   |  1   | Variable |    2     | Variable |
+	//      +----+------+------+----------+----------+----------+
+
+	//     The fields in the UDP request header are:
+
+	//          o  RSV  Reserved X'0000'
+	//          o  FRAG    Current fragment number
+	//          o  ATYP    address type of following addresses:
+	//             o  IP V4 address: X'01'
+	//             o  DOMAINNAME: X'03'
+	//             o  IP V6 address: X'04'
+	//          o  DST.ADDR       desired destination address
+	//          o  DST.PORT       desired destination port
+	//          o  DATA     user data
+	if len(buffer) > 10 {
+		return "", nil, fmt.Errorf("Udp head buffer length(%v) is too small", len(buffer))
+	}
+	// get host type
+	var (
+		addrLen   int
+		perfixLen int
+
+		host string
+		port int
+	)
+	switch buffer[3] {
+	case IPv4:
+		addrLen = net.IPv4len
+		perfixLen = 4
+	case DOMAINNAME:
+		addrLen = int(buffer[4])
+		perfixLen = 4 + 1
+	case IPv6:
+		addrLen = net.IPv6len
+		perfixLen = 4
+	}
+	// TODO: don't have enough data.
+	switch buffer[3] {
+	case IPv4, IPv6:
+		host = net.IP(buffer[perfixLen : perfixLen+addrLen]).String()
+	case DOMAINNAME:
+		host = string(buffer[perfixLen : perfixLen+addrLen])
+	}
+	port = int(binary.BigEndian.Uint16(buffer[perfixLen+addrLen : perfixLen+addrLen+2]))
+	targetHost = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	data = buffer[perfixLen+addrLen:]
+	return
+}
+
+func DefaultHandleAssociate() (*net.UDPConn, error) {
+	laddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp", laddr)
 }
 
 func (sl *Socks5Listen) Listen() (err error) {
@@ -223,7 +288,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 			}
 		}
 	}
-	hostPort, err := sl.getRequest(conn)
+	hostPort, cmd, err := sl.getRequest(conn)
 	if err != nil {
 		return err
 	}
@@ -236,18 +301,35 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 	//       | 1  |  1  | X'00' |  1   | Variable |    2     |
 	//       +----+-----+-------+------+----------+----------+
 	// handle connect.
-	target, err := sl.HandleConnect(hostPort)
-	if err != nil {
-		return err
+	switch cmd {
+	case CONNECT:
+		target, err := sl.HandleConnect(hostPort)
+		if err != nil {
+			return err
+		}
+		defer target.Close()
+		local := target.LocalAddr().(*net.TCPAddr)
+		bind := AddrSpec{IP: local.IP, Port: local.Port}
+		err = sl.sendReply(conn, SUCCEEDED, &bind)
+		if err != nil {
+			return err
+		}
+		return sl.Transport(target, conn)
+	case ASSOCIATE:
+		target, err := sl.HandleAssociate()
+		if err != nil {
+			return err
+		}
+		defer target.Close()
+		local := target.LocalAddr().(*net.UDPAddr)
+		bind := AddrSpec{IP: local.IP, Port: local.Port}
+		err = sl.sendReply(conn, SUCCEEDED, &bind)
+		// handle udp.
+
+		return nil
+	default:
+		return fmt.Errorf("Not support reply cmd:%v", cmd)
 	}
-	defer target.Close()
-	local := target.LocalAddr().(*net.TCPAddr)
-	bind := AddrSpec{IP: local.IP, Port: local.Port}
-	err = sl.sendReply(conn, SUCCEEDED, &bind)
-	if err != nil {
-		return err
-	}
-	return sl.Transport(target, conn)
 }
 
 // sendReply is used to send a reply message
@@ -296,7 +378,7 @@ func (sl *Socks5Listen) sendReply(w io.Writer, resp uint8, addr *AddrSpec) error
 	return err
 }
 
-func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
+func (sl *Socks5Listen) getRequest(conn net.Conn) (string, int, error) {
 	// The SOCKS request is formed as follows:
 	//       +----+-----+-------+------+----------+----------+
 	//       |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
@@ -307,57 +389,60 @@ func (sl *Socks5Listen) getRequest(conn net.Conn) (string, error) {
 	buf := make([]byte, 262)
 	n, err := io.ReadAtLeast(conn, buf, 5)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if buf[0] != Ver {
-		return "", fmt.Errorf("Not support version:%v", buf[0])
+		return "", 0, fmt.Errorf("Not support version:%v", buf[0])
 	}
+	var (
+		addrLen   = 0
+		perfixLen = 0
+	)
+	// ATYP
+	switch buf[3] {
+	case IPv4:
+		perfixLen = 4
+		addrLen = net.IPv4len
+	case DOMAINNAME:
+		perfixLen = 5
+		addrLen = int(buf[4])
+	case IPv6:
+		perfixLen = 4
+		addrLen = net.IPv6len
+	}
+	// prot's length is 2.
+	reqLen := perfixLen + addrLen + 2
+	if n < reqLen {
+		if _, err = io.ReadFull(conn, buf[n:reqLen]); err != nil {
+			return "", 0, err
+		}
+	} else if n > reqLen {
+		return "", 0, fmt.Errorf("Error request's length:%v", n)
+	}
+	// get dst's addr and port.
+	var host string
+	switch buf[3] {
+	case IPv4, IPv6:
+		host = net.IP(buf[perfixLen : perfixLen+addrLen]).String()
+	case DOMAINNAME:
+		host = string(buf[perfixLen : perfixLen+addrLen])
+	}
+	port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
+	hostPort := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	switch buf[1] {
 	case CONNECT:
-		var (
-			addrLen   = 0
-			perfixLen = 0
-		)
-		// ATYP
-		switch buf[3] {
-		case IPv4:
-			perfixLen = 4
-			addrLen = net.IPv4len
-		case DOMAINNAME:
-			perfixLen = 5
-			addrLen = int(buf[4])
-		case IPv6:
-			perfixLen = 4
-			addrLen = net.IPv6len
-		}
-		// prot's length is 2.
-		reqLen := perfixLen + addrLen + 2
-		if n < reqLen {
-			if _, err = io.ReadFull(conn, buf[n:reqLen]); err != nil {
-				return "", err
-			}
-		} else if n > reqLen {
-			return "", fmt.Errorf("Error request's length:%v", n)
-		}
-		// get dst's addr and port.
-		var host string
-		switch buf[3] {
-		case IPv4, IPv6:
-			host = net.IP(buf[perfixLen : perfixLen+addrLen]).String()
-		case DOMAINNAME:
-			host = string(buf[perfixLen : perfixLen+addrLen])
-		}
-		port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
-		host = net.JoinHostPort(host, strconv.Itoa(int(port)))
-		return host, nil
+		return hostPort, CONNECT, nil
 	case BIND:
 		// TODO
-		return "", nil
+		return "", BIND, fmt.Errorf("Not support cmd:%v", "BIND")
 	case ASSOCIATE:
-		// TODO
-		return "", nil
+		if host == "0.0.0.0" {
+			host = conn.RemoteAddr().(*net.TCPAddr).IP.String()
+			hostPort = net.JoinHostPort(host, strconv.Itoa(int(port)))
+		}
+		return hostPort, ASSOCIATE, fmt.Errorf("Not support cmd:%v", "ASSOCIATE")
 	default:
-		return "", fmt.Errorf("Not support command:%v", buf[1])
+		return "", 0, fmt.Errorf("Not support command:%v", buf[1])
 	}
 }
 
