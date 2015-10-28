@@ -31,6 +31,16 @@ func main() {
 			_, err := io.Copy(target, client)
 			return err
 		},
+		Auth: func(id, pwd []byte) bool {
+			logger.Println(len(id), len(pwd))
+			logger.Printf("user(%s) pwd(%s)", id, pwd)
+			return true
+		},
+		HandleAssociate: proxy.DefaultHandleAssociate,
+		TransportUdp:    proxy.DefaultTransportUdp,
+
+		AddrForClient: "127.0.0.1",
+
 		RawListen: listen,
 	}
 	socks5.Listen()

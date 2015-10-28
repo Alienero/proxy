@@ -78,6 +78,7 @@ type AddrSpec struct {
 
 type Socks5Listen struct {
 	RawListen       net.Listener
+	AddrForClient   string
 	EnableAuth      bool
 	Auth            func(id, pwd []byte) bool
 	HandleConnect   func(addr string) (*net.TCPConn, error)
@@ -128,6 +129,7 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 				return
 			}
 			if clientAddr == net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port))) {
+				fmt.Println("Get udp client data.")
 				// data from client.
 				hostPort, data, err := GetUdpRequest(buff[:n])
 				if err != nil {
@@ -141,6 +143,7 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 					close(errCh)
 					return
 				}
+				fmt.Println("target addr:", targetAddr)
 				n, err = localConn.WriteToUDP(data, targetAddr)
 				if err != nil {
 					errCh <- err
@@ -166,7 +169,7 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 		}
 
 	}()
-
+	fmt.Println("handle udp transport.")
 	for {
 		select {
 		case <-stop:
@@ -216,7 +219,7 @@ func SetUdpRequest(dstAddr *net.UDPAddr, frag int, data []byte) ([]byte, error) 
 }
 
 func GetUdpRequest(buffer []byte) (targetHostPort string, data []byte, err error) {
-	if len(buffer) > 10 {
+	if len(buffer) < 10 {
 		return "", nil, fmt.Errorf("Udp head buffer length(%v) is too small", len(buffer))
 	}
 	// get host type
@@ -322,6 +325,10 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 		for _, i := range head[2:msgLen] {
 			switch int(i) {
 			case NOAUTHENTICATION:
+				if !sl.EnableAuth {
+					method = NOAUTHENTICATION
+					break
+				}
 				if NOAUTHENTICATION > method {
 					method = NOAUTHENTICATION
 				}
@@ -356,30 +363,47 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 
 		// check the user and password.
 		// read username.
-		head1 := head[:2]
-		if _, err = io.ReadAtLeast(conn, head, 2); err != nil {
+		head1 := make([]byte, 513)
+		n, err := io.ReadAtLeast(conn, head, 3)
+		if err != nil {
 			return err
 		}
 		ulen := int(head1[1])
-		if ulen < 1 || ulen > 255 {
+		if ulen < 0 || ulen > 255 {
 			return fmt.Errorf("Error ulen:%v", ulen)
 		}
-		uname := make([]byte, ulen)
-		if _, err = io.ReadAtLeast(conn, uname, ulen); err != nil {
-			return err
+		var uname []byte
+		if ulen < 0 {
+			uname = []byte("")
+		} else {
+			uname = make([]byte, ulen)
+			if n < ulen+3 {
+				if n1, err := io.ReadAtLeast(conn, head1[n:ulen+3], ulen+3-n); err != nil {
+					return err
+				} else {
+					n += n1
+				}
+			}
+			copy(uname, head1[2:2+ulen])
 		}
-		head2 := head[:1]
-		if _, err = io.ReadAtLeast(conn, head2, 1); err != nil {
-			return err
-		}
-		plen := int(head2[0])
-		if plen < 1 || plen > 255 {
+
+		plen := int(head1[2+ulen])
+		if plen < 0 || plen > 255 {
 			return fmt.Errorf("Error plen:%v", ulen)
 		}
-		passwd := make([]byte, plen)
-		if _, err = io.ReadAtLeast(conn, passwd, plen); err != nil {
-			return err
+		var passwd []byte
+		if plen == 0 {
+			passwd = []byte("")
+		} else {
+			passwd = make([]byte, plen)
+			if n < 3+ulen+plen {
+				if _, err = io.ReadFull(conn, head1[n:ulen+plen+3]); err != nil {
+					return err
+				}
+			}
+			copy(passwd, head1[3+ulen:3+ulen+plen])
 		}
+
 		if !sl.Auth(uname, passwd) {
 			// not allower user.
 			conn.Write([]byte{0x01, 0x01})
@@ -393,7 +417,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 	}
 	hostPort, cmd, err := sl.getRequest(conn)
 	if err != nil {
-		return err
+		return fmt.Errorf("get request error:%v", err)
 	}
 	// replay.
 	// The server evaluates the request, and
@@ -425,7 +449,8 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 		}
 		defer target.Close()
 		local := target.LocalAddr().(*net.UDPAddr)
-		bind := AddrSpec{IP: local.IP, Port: local.Port}
+		bind := AddrSpec{IP: net.ParseIP(sl.AddrForClient), Port: local.Port}
+		fmt.Println("Udp bin:", bind)
 		err = sl.sendReply(conn, SUCCEEDED, &bind)
 		// handle udp.
 		stop := make(chan struct{}, 1)
@@ -434,6 +459,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 				b := make([]byte, 1)
 				_, err := conn.Read(b)
 				if err != nil {
+					fmt.Println("stop udp: tcp error:", err)
 					stop <- struct{}{}
 					close(stop)
 					return
@@ -560,7 +586,7 @@ func (sl *Socks5Listen) getRequest(conn net.Conn) (string, int, error) {
 			host = conn.RemoteAddr().(*net.TCPAddr).IP.String()
 			hostPort = net.JoinHostPort(host, strconv.Itoa(int(port)))
 		}
-		return hostPort, ASSOCIATE, fmt.Errorf("Not support cmd:%v", "ASSOCIATE")
+		return hostPort, ASSOCIATE, nil
 	default:
 		return "", 0, fmt.Errorf("Not support command:%v", buf[1])
 	}
