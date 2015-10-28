@@ -335,7 +335,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 	switch {
 	case sl.EnableAuth && method == USERPASSWORD:
 		// ok,pass.
-	case !sl.EnableAuth && method == NOAUTHENTICATION:
+	case !sl.EnableAuth && (method == NOAUTHENTICATION || method == USERPASSWORD):
 		// ok.pass.
 	default:
 		_, err = conn.Write([]byte{Ver, NOTACCEPTMETHOD})
