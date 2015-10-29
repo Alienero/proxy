@@ -133,6 +133,7 @@ func DefaultTransport(target net.Conn, client net.Conn) error {
 func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan struct{}) error {
 	buff := make([]byte, MaxUdpLen)
 	errCh := make(chan error, 1)
+	allowList := make(map[string]bool)
 	// read data.
 	go func() {
 		clientUdpAddr, err := net.ResolveUDPAddr("udp", clientAddr)
@@ -148,25 +149,22 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 				close(errCh)
 				return
 			}
-			fmt.Println("udp length:", n)
-			if clientAddr == net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port))) {
-				fmt.Println("Get udp client data.")
+			if clientUdpAddr.String() == addr.String() {
 				// data from client.
+				fmt.Println("data from client")
 				hostPort, data, err := GetUdpRequest(buff[:n])
 				if err != nil {
 					errCh <- err
 					close(errCh)
 					return
 				}
-				// fmt.Println(buff[:n], data)
-				// fmt.Println(data)
 				targetAddr, err := net.ResolveUDPAddr("udp", hostPort)
 				if err != nil {
 					errCh <- err
 					close(errCh)
 					return
 				}
-				fmt.Println("target addr:", targetAddr)
+				allowList[targetAddr.String()] = true
 				n, err = localConn.WriteToUDP(data, targetAddr)
 				if err != nil {
 					errCh <- err
@@ -175,23 +173,20 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 				}
 
 			} else {
-				fmt.Println("Get udp remote data.")
 				// data from remote server.
-				// TODO: here is client addr or remote server's addr ?
-				// Should use remote server's addr. If clinet only send domian name
-				// , when I read some data from remote server, I only can get IP.
-				// Do I need a map, manage domian[IP] ?.
-				data, err := SetUdpRequest(clientUdpAddr, 0, buff[:n])
+				fmt.Println("data from remote")
+				// check remote addr
+				if _, ok := allowList[clientAddr]; !ok {
+					continue
+				}
+				data, err := SetUdpRequest(addr, 0, buff[:n])
 				if err != nil {
 					errCh <- err
 					close(errCh)
 					return
 				}
-				fmt.Println(buff[:n], data)
-				fmt.Println(data)
 				_, err = localConn.WriteToUDP(data, clientUdpAddr)
 				if err != nil {
-					fmt.Println("Send to client error")
 					errCh <- err
 					close(errCh)
 					return
