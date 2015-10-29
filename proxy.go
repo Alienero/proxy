@@ -88,6 +88,26 @@ type Socks5Listen struct {
 	TransportUdp func(localConn *net.UDPConn, clientAddr string, stop chan struct{}) error
 }
 
+func NewDefaultSocks5Listen() (*Socks5Listen, error) {
+	listen, err := net.Listen("tcp", "127.0.0.1:9090")
+	if err != nil {
+		return nil, err
+	}
+	return &Socks5Listen{
+		HandleConnect: DefaultHandleConnect,
+		Transport:     DefaultTransport,
+		Auth: func(id, pwd []byte) bool {
+			return true
+		},
+		HandleAssociate: DefaultHandleAssociate,
+		TransportUdp:    DefaultTransportUdp,
+
+		AddrForClient: "127.0.0.1",
+
+		RawListen: listen,
+	}, nil
+}
+
 func DefaultHandleAssociate() (*net.UDPConn, error) {
 	laddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
 	if err != nil {
@@ -152,6 +172,7 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 				}
 
 			} else {
+				fmt.Println("Get udp remote data.")
 				// data from remote server.
 				data, err := SetUdpRequest(clientUdpAddr, 0, buff[:n])
 				if err != nil {
@@ -169,7 +190,6 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 		}
 
 	}()
-	fmt.Println("handle udp transport.")
 	for {
 		select {
 		case <-stop:
@@ -364,7 +384,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 		// check the user and password.
 		// read username.
 		head1 := make([]byte, 513)
-		n, err := io.ReadAtLeast(conn, head, 3)
+		n, err := io.ReadAtLeast(conn, head1, 3)
 		if err != nil {
 			return err
 		}
@@ -373,7 +393,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 			return fmt.Errorf("Error ulen:%v", ulen)
 		}
 		var uname []byte
-		if ulen < 0 {
+		if ulen == 0 {
 			uname = []byte("")
 		} else {
 			uname = make([]byte, ulen)
@@ -403,7 +423,7 @@ func (sl *Socks5Listen) serve(conn net.Conn) error {
 			}
 			copy(passwd, head1[3+ulen:3+ulen+plen])
 		}
-
+		fmt.Printf("user(%v):%s,psw(%v):%s\n", ulen, uname, plen, passwd)
 		if !sl.Auth(uname, passwd) {
 			// not allower user.
 			conn.Write([]byte{0x01, 0x01})
