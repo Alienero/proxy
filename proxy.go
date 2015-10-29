@@ -134,7 +134,7 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 	buff := make([]byte, MaxUdpLen)
 	errCh := make(chan error, 1)
 	allowList := make(map[string]bool)
-	// read data.
+	// read data
 	go func() {
 		clientUdpAddr, err := net.ResolveUDPAddr("udp", clientAddr)
 		if err != nil {
