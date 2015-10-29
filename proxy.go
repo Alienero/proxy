@@ -148,6 +148,7 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 				close(errCh)
 				return
 			}
+			fmt.Println("udp length:", n)
 			if clientAddr == net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port))) {
 				fmt.Println("Get udp client data.")
 				// data from client.
@@ -157,6 +158,8 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 					close(errCh)
 					return
 				}
+				// fmt.Println(buff[:n], data)
+				// fmt.Println(data)
 				targetAddr, err := net.ResolveUDPAddr("udp", hostPort)
 				if err != nil {
 					errCh <- err
@@ -174,14 +177,21 @@ func DefaultTransportUdp(localConn *net.UDPConn, clientAddr string, stop chan st
 			} else {
 				fmt.Println("Get udp remote data.")
 				// data from remote server.
+				// TODO: here is client addr or remote server's addr ?
+				// Should use remote server's addr. If clinet only send domian name
+				// , when I read some data from remote server, I only can get IP.
+				// Do I need a map, manage domian[IP] ?.
 				data, err := SetUdpRequest(clientUdpAddr, 0, buff[:n])
 				if err != nil {
 					errCh <- err
 					close(errCh)
 					return
 				}
+				fmt.Println(buff[:n], data)
+				fmt.Println(data)
 				_, err = localConn.WriteToUDP(data, clientUdpAddr)
 				if err != nil {
+					fmt.Println("Send to client error")
 					errCh <- err
 					close(errCh)
 					return
@@ -270,7 +280,7 @@ func GetUdpRequest(buffer []byte) (targetHostPort string, data []byte, err error
 	}
 	port = int(binary.BigEndian.Uint16(buffer[perfixLen+addrLen : perfixLen+addrLen+2]))
 	targetHostPort = net.JoinHostPort(host, strconv.Itoa(int(port)))
-	data = buffer[perfixLen+addrLen:]
+	data = buffer[perfixLen+addrLen+2:]
 	return
 }
 
